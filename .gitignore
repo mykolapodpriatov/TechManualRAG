@@ -16,6 +16,7 @@ env/
 chroma/
 qdrant_storage/
 storage/
+data/
 
 # Logs & local artifacts
 logs/

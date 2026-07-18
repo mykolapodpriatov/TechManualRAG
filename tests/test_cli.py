@@ -12,7 +12,7 @@ from pathlib import Path
 import fitz
 import pytest
 
-from ingest import main
+from ingest import chunk_id, main
 
 PAGE_TEXTS = [
     "Section 1 Overview of the hydraulic assembly and safety notes.",
@@ -39,7 +39,9 @@ def pdf_path(tmp_path: Path) -> Path:
     return path
 
 
-def test_json_output_is_valid(pdf_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_json_output_is_valid(
+    pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     exit_code = main([str(pdf_path), "--json"])
     assert exit_code == 0
 
@@ -69,7 +71,16 @@ def test_chunk_size_and_overlap_flags(
     pdf_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     exit_code = main(
-        [str(pdf_path), "--json", "--pages", "1", "--chunk-size", "20", "--overlap", "5"]
+        [
+            str(pdf_path),
+            "--json",
+            "--pages",
+            "1",
+            "--chunk-size",
+            "20",
+            "--overlap",
+            "5",
+        ]
     )
     assert exit_code == 0
 
@@ -79,7 +90,9 @@ def test_chunk_size_and_overlap_flags(
     assert all(len(chunk) <= 20 for chunk in chunks)
 
 
-def test_human_readable_output(pdf_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_human_readable_output(
+    pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     exit_code = main([str(pdf_path)])
     assert exit_code == 0
 
@@ -119,3 +132,65 @@ def test_bad_pages_value_exits_nonzero(
     exit_code = main([str(pdf_path), "--pages", "3-1"])
     assert exit_code != 0
     assert "--pages" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Stable chunk ids (--with-ids)
+# --------------------------------------------------------------------------- #
+
+
+def test_chunk_id_format_is_stable() -> None:
+    assert chunk_id(1, 0) == "p1-c0"
+    assert chunk_id(3, 12) == "p3-c12"
+    # Same inputs always yield the same id.
+    assert chunk_id(2, 5) == chunk_id(2, 5)
+
+
+def test_chunk_id_is_unique_across_page_and_index() -> None:
+    ids = [chunk_id(page, index) for page in range(1, 6) for index in range(4)]
+    assert len(ids) == len(set(ids))
+
+
+def test_default_json_chunks_are_bare_strings(
+    pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main([str(pdf_path), "--json"])
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    for record in payload:
+        assert all(isinstance(chunk, str) for chunk in record["chunks"])
+
+
+def test_with_ids_emits_id_and_text_objects(
+    pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main(
+        [str(pdf_path), "--json", "--with-ids", "--chunk-size", "20", "--overlap", "5"]
+    )
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    all_ids: list[str] = []
+    for record in payload:
+        page_no = record["page"]
+        for index, chunk in enumerate(record["chunks"]):
+            assert set(chunk) == {"id", "text"}
+            assert isinstance(chunk["text"], str)
+            assert chunk["id"] == f"p{page_no}-c{index}"
+            all_ids.append(chunk["id"])
+
+    # Ids are unique across the whole document.
+    assert len(all_ids) == len(set(all_ids))
+    assert all_ids  # the fixture yields at least one chunk
+
+
+def test_with_ids_preserves_chunk_text(
+    pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main([str(pdf_path), "--json", "--with-ids", "--pages", "1"])
+    assert exit_code == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    joined = " ".join(chunk["text"] for chunk in payload[0]["chunks"])
+    assert "hydraulic assembly" in joined

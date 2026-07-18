@@ -14,10 +14,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install ruff
-        run: pip install ruff==0.14.14
+      - name: Install lint tools
+        run: pip install ruff==0.14.14 mypy
       - name: Ruff lint
         run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+      - name: Type check
+        run: mypy .
       - name: Byte-compile sources
         run: python -m compileall -q .
 

@@ -119,16 +119,109 @@ def chunk_text(
     return chunks
 
 
+def chunk_text_words(
+    text: str,
+    size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_OVERLAP,
+) -> list[str]:
+    """Split ``text`` into overlapping chunks without cutting words.
+
+    Unlike :func:`chunk_text`, which slices on raw character offsets and can
+    therefore end a chunk mid-word, this packs whole whitespace-delimited
+    tokens into each chunk up to ``size`` characters. Consecutive chunks share
+    a suffix/prefix of whole words spanning at least ``overlap`` characters (as
+    far as whole words allow), so no token is ever split across a boundary.
+
+    Args:
+        text: The text to split. Runs of whitespace are normalised to single
+            spaces within a chunk.
+        size: Soft maximum characters per chunk (must be positive). A single
+            token longer than ``size`` becomes its own oversized chunk rather
+            than being cut.
+        overlap: Approximate characters shared between neighbours
+            (0 <= overlap < size), rounded up to whole words.
+
+    Returns:
+        The list of chunks; empty when ``text`` contains no tokens.
+
+    Raises:
+        ValueError: If ``size``/``overlap`` are outside their valid ranges.
+    """
+    if size <= 0:
+        raise ValueError("size must be a positive integer.")
+    if overlap < 0:
+        raise ValueError("overlap must be non-negative.")
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than size.")
+
+    words = text.split()
+    if not words:
+        return []
+
+    total = len(words)
+    chunks: list[str] = []
+    start = 0
+    while start < total:
+        # Greedily pack whole words into the current chunk up to `size` chars.
+        # The first word is always taken, even if it alone exceeds `size`, so a
+        # single long token is never split.
+        end = start
+        length = 0
+        while end < total:
+            addition = len(words[end]) + (1 if end > start else 0)
+            if length + addition > size and end > start:
+                break
+            length += addition
+            end += 1
+
+        chunks.append(" ".join(words[start:end]))
+        if end >= total:
+            break
+
+        if overlap == 0:
+            start = end
+            continue
+
+        # Step back over whole trailing words until they span at least
+        # `overlap` characters, but always advance by at least one word so the
+        # loop terminates even for a single oversized token.
+        next_start = end - 1
+        while next_start > start + 1 and len(" ".join(words[next_start:end])) < overlap:
+            next_start -= 1
+        start = max(next_start, start + 1)
+
+    return chunks
+
+
 def chunk_pages(
     pages: list[Page],
     size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_OVERLAP,
+    *,
+    words: bool = False,
 ) -> list[PageChunks]:
-    """Chunk every page while preserving its 1-based page number."""
+    """Chunk every page while preserving its 1-based page number.
+
+    When ``words`` is true, chunking respects whole-word boundaries via
+    :func:`chunk_text_words`; otherwise the character-window
+    :func:`chunk_text` is used.
+    """
+    chunker = chunk_text_words if words else chunk_text
     return [
-        PageChunks(page_no=page.page_no, chunks=chunk_text(page.text, size, overlap))
+        PageChunks(page_no=page.page_no, chunks=chunker(page.text, size, overlap))
         for page in pages
     ]
+
+
+def chunk_id(page_no: int, index: int) -> str:
+    """Return the stable identifier for one chunk within a document.
+
+    The id combines the 1-based ``page_no`` with the 0-based per-page chunk
+    ``index`` (e.g. ``"p1-c0"``). It is unique across a document and stable for
+    a given extraction/chunking configuration, which is what the roadmap's
+    Qdrant indexing step keys each vector on.
+    """
+    return f"p{page_no}-c{index}"
 
 
 # --------------------------------------------------------------------------- #
@@ -157,9 +250,7 @@ def _parse_page_range(spec: str) -> tuple[int, int]:
         ) from None
 
     if lo < 1 or hi < lo:
-        raise ValueError(
-            f"invalid --pages value {spec!r}; expected 1 <= start <= end"
-        )
+        raise ValueError(f"invalid --pages value {spec!r}; expected 1 <= start <= end")
     return lo, hi
 
 
@@ -168,8 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ingest",
         description=(
-            "Extract text from an engineering PDF and split it into "
-            "overlapping chunks."
+            "Extract text from an engineering PDF and split it into overlapping chunks."
         ),
     )
     parser.add_argument("pdf", type=Path, help="Path to the source PDF file.")
@@ -178,6 +268,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="as_json",
         help="Emit a JSON array of {page, chunks} records to stdout.",
+    )
+    parser.add_argument(
+        "--with-ids",
+        action="store_true",
+        dest="with_ids",
+        help=(
+            "In --json mode, emit each chunk as a {id, text} object with a "
+            "stable id (p{page}-c{index}) instead of a bare string."
+        ),
     )
     parser.add_argument(
         "--chunk-size",
@@ -194,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Characters shared between chunks (default: {DEFAULT_OVERLAP}).",
     )
     parser.add_argument(
+        "--words",
+        action="store_true",
+        help="Chunk on whole-word boundaries so no token is split mid-word.",
+    )
+    parser.add_argument(
         "--pages",
         metavar="RANGE",
         default=None,
@@ -206,6 +310,30 @@ def _fail(message: str) -> int:
     """Print an error to stderr and return the usage exit code."""
     print(f"error: {message}", file=sys.stderr)
     return _EXIT_USAGE
+
+
+def _json_records(
+    page_chunks: list[PageChunks], *, with_ids: bool
+) -> list[dict[str, object]]:
+    """Build the ``--json`` payload for ``page_chunks``.
+
+    Without ``with_ids`` each page's ``chunks`` field is a list of raw strings
+    (the default, so existing consumers are unaffected). With it, every chunk
+    becomes a ``{"id": ..., "text": ...}`` record carrying a stable
+    :func:`chunk_id`.
+    """
+    records: list[dict[str, object]] = []
+    for pc in page_chunks:
+        chunks: object
+        if with_ids:
+            chunks = [
+                {"id": chunk_id(pc.page_no, index), "text": text}
+                for index, text in enumerate(pc.chunks)
+            ]
+        else:
+            chunks = pc.chunks
+        records.append({"page": pc.page_no, "chunks": chunks})
+    return records
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -236,12 +364,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         pages = [page for page in pages if lo <= page.page_no <= hi]
 
     try:
-        page_chunks = chunk_pages(pages, args.chunk_size, args.overlap)
+        page_chunks = chunk_pages(
+            pages, args.chunk_size, args.overlap, words=args.words
+        )
     except ValueError as exc:
         return _fail(str(exc))
 
     if args.as_json:
-        payload = [{"page": pc.page_no, "chunks": pc.chunks} for pc in page_chunks]
+        payload = _json_records(page_chunks, with_ids=args.with_ids)
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:

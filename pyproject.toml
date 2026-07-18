@@ -1,0 +1,16 @@
+[tool.ruff]
+# Match the Python version and the ruff 0.14.14 rule set used in CI.
+target-version = "py312"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.12"
+# Lenient: this is an early-stage scaffold with untyped third-party deps.
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = true

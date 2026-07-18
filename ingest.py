@@ -213,6 +213,17 @@ def chunk_pages(
     ]
 
 
+def chunk_id(page_no: int, index: int) -> str:
+    """Return the stable identifier for one chunk within a document.
+
+    The id combines the 1-based ``page_no`` with the 0-based per-page chunk
+    ``index`` (e.g. ``"p1-c0"``). It is unique across a document and stable for
+    a given extraction/chunking configuration, which is what the roadmap's
+    Qdrant indexing step keys each vector on.
+    """
+    return f"p{page_no}-c{index}"
+
+
 # --------------------------------------------------------------------------- #
 # Command-line interface
 # --------------------------------------------------------------------------- #
@@ -259,6 +270,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit a JSON array of {page, chunks} records to stdout.",
     )
     parser.add_argument(
+        "--with-ids",
+        action="store_true",
+        dest="with_ids",
+        help=(
+            "In --json mode, emit each chunk as a {id, text} object with a "
+            "stable id (p{page}-c{index}) instead of a bare string."
+        ),
+    )
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=DEFAULT_CHUNK_SIZE,
@@ -290,6 +310,30 @@ def _fail(message: str) -> int:
     """Print an error to stderr and return the usage exit code."""
     print(f"error: {message}", file=sys.stderr)
     return _EXIT_USAGE
+
+
+def _json_records(
+    page_chunks: list[PageChunks], *, with_ids: bool
+) -> list[dict[str, object]]:
+    """Build the ``--json`` payload for ``page_chunks``.
+
+    Without ``with_ids`` each page's ``chunks`` field is a list of raw strings
+    (the default, so existing consumers are unaffected). With it, every chunk
+    becomes a ``{"id": ..., "text": ...}`` record carrying a stable
+    :func:`chunk_id`.
+    """
+    records: list[dict[str, object]] = []
+    for pc in page_chunks:
+        chunks: object
+        if with_ids:
+            chunks = [
+                {"id": chunk_id(pc.page_no, index), "text": text}
+                for index, text in enumerate(pc.chunks)
+            ]
+        else:
+            chunks = pc.chunks
+        records.append({"page": pc.page_no, "chunks": chunks})
+    return records
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -327,7 +371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail(str(exc))
 
     if args.as_json:
-        payload = [{"page": pc.page_no, "chunks": pc.chunks} for pc in page_chunks]
+        payload = _json_records(page_chunks, with_ids=args.with_ids)
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:

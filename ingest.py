@@ -119,14 +119,96 @@ def chunk_text(
     return chunks
 
 
+def chunk_text_words(
+    text: str,
+    size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_OVERLAP,
+) -> list[str]:
+    """Split ``text`` into overlapping chunks without cutting words.
+
+    Unlike :func:`chunk_text`, which slices on raw character offsets and can
+    therefore end a chunk mid-word, this packs whole whitespace-delimited
+    tokens into each chunk up to ``size`` characters. Consecutive chunks share
+    a suffix/prefix of whole words spanning at least ``overlap`` characters (as
+    far as whole words allow), so no token is ever split across a boundary.
+
+    Args:
+        text: The text to split. Runs of whitespace are normalised to single
+            spaces within a chunk.
+        size: Soft maximum characters per chunk (must be positive). A single
+            token longer than ``size`` becomes its own oversized chunk rather
+            than being cut.
+        overlap: Approximate characters shared between neighbours
+            (0 <= overlap < size), rounded up to whole words.
+
+    Returns:
+        The list of chunks; empty when ``text`` contains no tokens.
+
+    Raises:
+        ValueError: If ``size``/``overlap`` are outside their valid ranges.
+    """
+    if size <= 0:
+        raise ValueError("size must be a positive integer.")
+    if overlap < 0:
+        raise ValueError("overlap must be non-negative.")
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than size.")
+
+    words = text.split()
+    if not words:
+        return []
+
+    total = len(words)
+    chunks: list[str] = []
+    start = 0
+    while start < total:
+        # Greedily pack whole words into the current chunk up to `size` chars.
+        # The first word is always taken, even if it alone exceeds `size`, so a
+        # single long token is never split.
+        end = start
+        length = 0
+        while end < total:
+            addition = len(words[end]) + (1 if end > start else 0)
+            if length + addition > size and end > start:
+                break
+            length += addition
+            end += 1
+
+        chunks.append(" ".join(words[start:end]))
+        if end >= total:
+            break
+
+        if overlap == 0:
+            start = end
+            continue
+
+        # Step back over whole trailing words until they span at least
+        # `overlap` characters, but always advance by at least one word so the
+        # loop terminates even for a single oversized token.
+        next_start = end - 1
+        while next_start > start + 1 and len(" ".join(words[next_start:end])) < overlap:
+            next_start -= 1
+        start = max(next_start, start + 1)
+
+    return chunks
+
+
 def chunk_pages(
     pages: list[Page],
     size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_OVERLAP,
+    *,
+    words: bool = False,
 ) -> list[PageChunks]:
-    """Chunk every page while preserving its 1-based page number."""
+    """Chunk every page while preserving its 1-based page number.
+
+    When ``words`` is true, chunking respects whole-word boundaries via
+    :func:`chunk_text_words`; otherwise the character-window
+    :func:`chunk_text` is used.
+    """
+    chunker = chunk_text_words if words else chunk_text
     return [
-        PageChunks(page_no=page.page_no, chunks=chunk_text(page.text, size, overlap))
+        PageChunks(page_no=page.page_no, chunks=chunker(page.text, size, overlap))
         for page in pages
     ]
 
@@ -157,9 +239,7 @@ def _parse_page_range(spec: str) -> tuple[int, int]:
         ) from None
 
     if lo < 1 or hi < lo:
-        raise ValueError(
-            f"invalid --pages value {spec!r}; expected 1 <= start <= end"
-        )
+        raise ValueError(f"invalid --pages value {spec!r}; expected 1 <= start <= end")
     return lo, hi
 
 
@@ -168,8 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ingest",
         description=(
-            "Extract text from an engineering PDF and split it into "
-            "overlapping chunks."
+            "Extract text from an engineering PDF and split it into overlapping chunks."
         ),
     )
     parser.add_argument("pdf", type=Path, help="Path to the source PDF file.")
@@ -192,6 +271,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OVERLAP,
         metavar="N",
         help=f"Characters shared between chunks (default: {DEFAULT_OVERLAP}).",
+    )
+    parser.add_argument(
+        "--words",
+        action="store_true",
+        help="Chunk on whole-word boundaries so no token is split mid-word.",
     )
     parser.add_argument(
         "--pages",
@@ -236,7 +320,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         pages = [page for page in pages if lo <= page.page_no <= hi]
 
     try:
-        page_chunks = chunk_pages(pages, args.chunk_size, args.overlap)
+        page_chunks = chunk_pages(
+            pages, args.chunk_size, args.overlap, words=args.words
+        )
     except ValueError as exc:
         return _fail(str(exc))
 

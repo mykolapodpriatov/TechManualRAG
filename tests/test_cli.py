@@ -194,3 +194,72 @@ def test_with_ids_preserves_chunk_text(
     payload = json.loads(capsys.readouterr().out)
     joined = " ".join(chunk["text"] for chunk in payload[0]["chunks"])
     assert "hydraulic assembly" in joined
+
+
+# --------------------------------------------------------------------------- #
+# --index wiring (retrieve.build_index itself is exercised in test_retrieve.py;
+# these tests only check that the CLI calls it with the right arguments,
+# stubbed out so they never need sentence-transformers/qdrant network access).
+# --------------------------------------------------------------------------- #
+
+
+def test_index_flag_calls_build_index_and_reports_to_stderr(
+    pdf_path: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import retrieve
+
+    calls: list[tuple[list, str, str]] = []
+
+    def fake_build_index(
+        page_chunks, collection_name, path=retrieve.DEFAULT_QDRANT_PATH, **_
+    ):
+        calls.append((page_chunks, collection_name, path))
+
+    monkeypatch.setattr(retrieve, "build_index", fake_build_index)
+
+    qdrant_path = str(tmp_path / "qdrant-store")
+    exit_code = main(
+        [
+            str(pdf_path),
+            "--index",
+            "--collection",
+            "my-manuals",
+            "--qdrant-path",
+            qdrant_path,
+        ]
+    )
+    assert exit_code == 0
+
+    assert len(calls) == 1
+    page_chunks, collection_name, path = calls[0]
+    assert collection_name == "my-manuals"
+    assert path == qdrant_path
+    assert [pc.page_no for pc in page_chunks] == [1, 2, 3]
+
+    err = capsys.readouterr().err
+    assert "Indexed" in err
+    assert "my-manuals" in err
+
+
+def test_index_flag_does_not_pollute_json_stdout(
+    pdf_path: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import retrieve
+
+    monkeypatch.setattr(retrieve, "build_index", lambda *a, **k: None)
+
+    qdrant_path = str(tmp_path / "qdrant-store")
+    exit_code = main([str(pdf_path), "--index", "--json", "--qdrant-path", qdrant_path])
+    assert exit_code == 0
+
+    out = capsys.readouterr().out
+    payload = json.loads(
+        out
+    )  # would raise if the index confirmation leaked into stdout
+    assert [record["page"] for record in payload] == [1, 2, 3]

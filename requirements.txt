@@ -4,6 +4,7 @@ llama-index-llms-ollama
 llama-index-multi-modal-llms-ollama
 llama-index-vector-stores-qdrant
 qdrant-client
+sentence-transformers
 PyMuPDF
 pytesseract
 pdf2image

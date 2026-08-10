@@ -8,6 +8,11 @@ stack (LlamaIndex, Streamlit, Ollama, ...).
 It also doubles as an offline CLI::
 
     python ingest.py manual.pdf --json --pages 1-3
+
+Passing ``--index`` additionally embeds the chunks and upserts them into a
+local Qdrant collection via :mod:`retrieve`, e.g.::
+
+    python ingest.py manual.pdf --index
 """
 
 from __future__ import annotations
@@ -23,6 +28,12 @@ import fitz  # PyMuPDF
 
 DEFAULT_CHUNK_SIZE = 512
 DEFAULT_OVERLAP = 50
+
+# Mirrors retrieve.DEFAULT_COLLECTION / retrieve.DEFAULT_QDRANT_PATH, duplicated
+# here (rather than imported) so building the CLI parser never requires
+# qdrant-client to be installed unless --index is actually used.
+_DEFAULT_COLLECTION = "manuals"
+_DEFAULT_QDRANT_PATH = "data/qdrant"
 
 
 @dataclass(frozen=True)
@@ -303,6 +314,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Only process this 1-based page range, e.g. '1-3' or '2'.",
     )
+    parser.add_argument(
+        "--index",
+        action="store_true",
+        help=(
+            "Embed the resulting chunks and upsert them into a local Qdrant "
+            "collection (see --collection) for later search with retrieve.py."
+        ),
+    )
+    parser.add_argument(
+        "--collection",
+        default=_DEFAULT_COLLECTION,
+        metavar="NAME",
+        help=f"Qdrant collection name for --index (default: {_DEFAULT_COLLECTION!r}).",
+    )
+    parser.add_argument(
+        "--qdrant-path",
+        default=_DEFAULT_QDRANT_PATH,
+        metavar="PATH",
+        help=f"On-disk path for the local Qdrant store (default: {_DEFAULT_QDRANT_PATH!r}).",
+    )
     return parser
 
 
@@ -369,6 +400,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except ValueError as exc:
         return _fail(str(exc))
+
+    if args.index:
+        # Imported lazily: qdrant-client (and the embedding model it triggers)
+        # is only needed when --index is actually requested, keeping plain
+        # extraction/chunking usage of this module dependency-light.
+        from retrieve import build_index
+
+        build_index(page_chunks, args.collection, path=args.qdrant_path)
+        total_chunks = sum(len(pc.chunks) for pc in page_chunks)
+        # Printed to stderr so stdout stays clean/parseable when --json is
+        # combined with --index.
+        print(
+            f"Indexed {total_chunks} chunk(s) from {len(page_chunks)} page(s) "
+            f"into Qdrant collection {args.collection!r} at {args.qdrant_path!r}.",
+            file=sys.stderr,
+        )
 
     if args.as_json:
         payload = _json_records(page_chunks, with_ids=args.with_ids)

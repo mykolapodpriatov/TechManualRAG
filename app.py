@@ -1,6 +1,7 @@
 import streamlit as st
 
 from ingest import extract_pages
+from retrieve import DEFAULT_COLLECTION, search
 
 PREVIEW_CHARS = 2000
 
@@ -32,8 +33,19 @@ def main():
 
     if st.button("Найти") and query:
         with st.spinner("Ищем в базе знаний..."):
-            # TODO: Поиск по текстовым и визуальным эмбеддингам
-            pass
+            results = search(query, DEFAULT_COLLECTION)
+
+        if not results:
+            st.info(
+                "Ничего не найдено. Сначала проиндексируйте руководство: "
+                "`python ingest.py manual.pdf --index`."
+            )
+        else:
+            for result in results:
+                with st.expander(
+                    f"Страница {result.page_no} · score {result.score:.3f}"
+                ):
+                    st.write(result.text)
 
 
 if __name__ == "__main__":

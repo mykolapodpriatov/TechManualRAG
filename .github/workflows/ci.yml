@@ -33,8 +33,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install minimal test deps
-        # Deliberately NOT `-r requirements.txt`: the ingest tests only need
-        # PyMuPDF, and pulling llama-index/streamlit/ollama would be slow.
-        run: pip install pytest PyMuPDF
+        # Deliberately NOT `-r requirements.txt`: pulling llama-index/streamlit/
+        # ollama/sentence-transformers would be slow. qdrant-client is light
+        # (no ML framework) and runs fully local/embedded, so it's cheap to add;
+        # retrieve.py tests inject a stub embedder instead of sentence-transformers.
+        run: pip install pytest PyMuPDF qdrant-client
       - name: Run tests
         run: pytest -q

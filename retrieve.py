@@ -9,12 +9,19 @@ Both :func:`build_index` and :func:`search` accept an optional ``embedder``
 override so callers (and the test suite) can swap in a tiny stub instead of
 loading the real BGE model, the same spirit as ``test_ingest.py`` staying
 independent of the heavy stack.
+
+It also doubles as an offline CLI::
+
+    python retrieve.py "torque spec" --collection manuals
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from qdrant_client import QdrantClient
@@ -194,3 +201,107 @@ def search(
         ]
     finally:
         client.close()
+
+
+# --------------------------------------------------------------------------- #
+# Command-line interface
+# --------------------------------------------------------------------------- #
+
+_EXIT_USAGE = 2
+_SNIPPET_CHARS = 80
+
+
+def _collection_exists(collection_name: str, path: str) -> bool:
+    """Return whether ``collection_name`` exists in the local Qdrant store."""
+    client = _open_client(path)
+    try:
+        return client.collection_exists(collection_name)
+    finally:
+        client.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the ``retrieve`` argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="retrieve",
+        description="Search a local Qdrant collection of ingested PDF chunks.",
+    )
+    parser.add_argument("query", help="Free-text search query.")
+    parser.add_argument(
+        "--collection",
+        default=DEFAULT_COLLECTION,
+        metavar="NAME",
+        help=f"Qdrant collection to search (default: {DEFAULT_COLLECTION!r}).",
+    )
+    parser.add_argument(
+        "--qdrant-path",
+        default=DEFAULT_QDRANT_PATH,
+        metavar="PATH",
+        help=f"On-disk path for the local Qdrant store (default: {DEFAULT_QDRANT_PATH!r}).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Maximum number of results to return (default: 5).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit a JSON array of {id, page, text, score} objects to stdout.",
+    )
+    return parser
+
+
+def _fail(message: str) -> int:
+    """Print an error to stderr and return the usage exit code."""
+    print(f"error: {message}", file=sys.stderr)
+    return _EXIT_USAGE
+
+
+def main(argv: Sequence[str] | None = None, *, embedder: Embedder | None = None) -> int:
+    """Run the CLI. Returns the process exit code (0 on success)."""
+    args = build_parser().parse_args(argv)
+
+    if not args.query.strip():
+        return _fail("query is empty")
+
+    if not _collection_exists(args.collection, args.qdrant_path):
+        return _fail(
+            f"collection {args.collection!r} does not exist yet. "
+            "Index a manual first: python ingest.py manual.pdf --index"
+        )
+
+    results = search(
+        args.query,
+        args.collection,
+        top_k=args.top_k,
+        path=args.qdrant_path,
+        embedder=embedder,
+    )
+
+    if args.as_json:
+        payload = [
+            {
+                "id": result.chunk_id,
+                "page": result.page_no,
+                "text": result.text,
+                "score": result.score,
+            }
+            for result in results
+        ]
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        for index, result in enumerate(results, start=1):
+            snippet = " ".join(result.text[:_SNIPPET_CHARS].split())
+            print(f"{index}. page {result.page_no}  score {result.score:.3f}")
+            print(f"   {snippet}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

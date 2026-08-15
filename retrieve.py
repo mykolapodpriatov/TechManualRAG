@@ -159,12 +159,34 @@ def build_index(
         client.close()
 
 
+def _page_range_filter(pages: tuple[int, int] | None) -> qmodels.Filter | None:
+    """Build an inclusive ``page_no`` payload filter, or ``None`` if unset.
+
+    Raises:
+        ValueError: If the range is inverted, empty, or not 1-based.
+    """
+    if pages is None:
+        return None
+    lo, hi = pages
+    if lo < 1 or hi < lo:
+        raise ValueError(f"invalid pages range {pages!r}; expected 1 <= start <= end")
+    return qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="page_no",
+                range=qmodels.Range(gte=lo, lte=hi),
+            )
+        ]
+    )
+
+
 def search(
     query: str,
     collection_name: str,
     top_k: int = 5,
     path: str = DEFAULT_QDRANT_PATH,
     *,
+    pages: tuple[int, int] | None = None,
     embedder: Embedder | None = None,
 ) -> list[SearchResult]:
     """Return the ``top_k`` chunks most relevant to ``query``.
@@ -174,12 +196,20 @@ def search(
         collection_name: Qdrant collection to search, as passed to :func:`build_index`.
         top_k: Maximum number of results to return.
         path: Directory of the local Qdrant store, as passed to :func:`build_index`.
+        pages: Optional inclusive 1-based ``(start, end)`` page range. When set,
+            only chunks whose ``page_no`` falls inside the range are returned.
         embedder: Optional embedding backend override; see :func:`embed_chunks`.
 
     Returns:
         Ranked :class:`SearchResult` items, best match first. Empty if the
         collection doesn't exist yet (nothing has been indexed).
+
+    Raises:
+        ValueError: If ``pages`` is inverted or empty (``end < start``) or
+            not 1-based.
     """
+    query_filter = _page_range_filter(pages)
+
     client = _open_client(path)
     try:
         if not client.collection_exists(collection_name):
@@ -187,7 +217,10 @@ def search(
 
         [query_vector] = embed_chunks([query], embedder=embedder)
         hits = client.query_points(
-            collection_name=collection_name, query=query_vector, limit=top_k
+            collection_name=collection_name,
+            query=query_vector,
+            limit=top_k,
+            query_filter=query_filter,
         ).points
         return [
             SearchResult(

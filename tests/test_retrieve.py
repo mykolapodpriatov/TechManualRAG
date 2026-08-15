@@ -176,6 +176,48 @@ def test_build_index_updates_existing_chunk_text(qdrant_path: str) -> None:
     assert results[0].text == "New content about torque specifications."
 
 
+def test_search_pages_restricts_hits_to_range(qdrant_path: str) -> None:
+    three_pages = [
+        PageChunks(page_no=1, chunks=["Torque spec page one about head bolts."]),
+        PageChunks(page_no=2, chunks=["Torque spec page two about lock nuts."]),
+        PageChunks(page_no=3, chunks=["Torque spec page three about washers."]),
+    ]
+    build_index(three_pages, "manuals", path=qdrant_path, embedder=_stub_embedder)
+
+    only_two = search(
+        "torque spec",
+        "manuals",
+        path=qdrant_path,
+        top_k=10,
+        pages=(2, 2),
+        embedder=_stub_embedder,
+    )
+    assert only_two
+    assert {result.page_no for result in only_two} == {2}
+
+    unfiltered = search(
+        "torque spec",
+        "manuals",
+        path=qdrant_path,
+        top_k=10,
+        embedder=_stub_embedder,
+    )
+    assert {result.page_no for result in unfiltered} == {1, 2, 3}
+    assert len(unfiltered) == 3
+
+
+def test_search_pages_rejects_inverted_range(qdrant_path: str) -> None:
+    build_index([TORQUE_CHUNKS], "manuals", path=qdrant_path, embedder=_stub_embedder)
+    with pytest.raises(ValueError, match="pages"):
+        search(
+            "torque spec",
+            "manuals",
+            path=qdrant_path,
+            pages=(3, 1),
+            embedder=_stub_embedder,
+        )
+
+
 def test_build_index_persists_across_client_instances(qdrant_path: str) -> None:
     # build_index and search each open/close their own client; this checks
     # the on-disk store genuinely persists between those separate sessions.

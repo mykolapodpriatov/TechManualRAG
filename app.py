@@ -29,11 +29,35 @@ def main():
         # TODO: Кропы изображений и таблиц
         # TODO: Индексация в Qdrant
 
+    with st.sidebar:
+        st.subheader("Страницы")
+        page_from = st.number_input(
+            "С страницы",
+            min_value=1,
+            value=None,
+            step=1,
+            placeholder="любая",
+        )
+        page_to = st.number_input(
+            "По страницу",
+            min_value=1,
+            value=None,
+            step=1,
+            placeholder="любая",
+        )
+
     query = st.text_input("Введите запрос к документации:")
 
     if st.button("Найти") and query:
+        page_range = None
+        if page_from is not None and page_to is not None:
+            page_range = (int(page_from), int(page_to))
         with st.spinner("Ищем в базе знаний..."):
-            results = search(query, DEFAULT_COLLECTION)
+            try:
+                results = search(query, DEFAULT_COLLECTION, pages=page_range)
+            except ValueError as exc:
+                st.error(str(exc))
+                results = []
 
         if not results:
             st.info(

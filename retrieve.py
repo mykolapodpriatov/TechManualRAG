@@ -187,6 +187,7 @@ def search(
     path: str = DEFAULT_QDRANT_PATH,
     *,
     pages: tuple[int, int] | None = None,
+    min_score: float | None = None,
     embedder: Embedder | None = None,
 ) -> list[SearchResult]:
     """Return the ``top_k`` chunks most relevant to ``query``.
@@ -198,6 +199,8 @@ def search(
         path: Directory of the local Qdrant store, as passed to :func:`build_index`.
         pages: Optional inclusive 1-based ``(start, end)`` page range. When set,
             only chunks whose ``page_no`` falls inside the range are returned.
+        min_score: Optional cosine-score floor in ``[0, 1]``. Hits below it
+            are dropped after the Qdrant query. ``None`` keeps every hit.
         embedder: Optional embedding backend override; see :func:`embed_chunks`.
 
     Returns:
@@ -206,8 +209,11 @@ def search(
 
     Raises:
         ValueError: If ``pages`` is inverted or empty (``end < start``) or
-            not 1-based.
+            not 1-based, or if ``min_score`` is outside ``[0, 1]``.
     """
+    if min_score is not None and not 0.0 <= min_score <= 1.0:
+        raise ValueError(f"min_score must be in [0, 1], got {min_score!r}")
+
     query_filter = _page_range_filter(pages)
 
     client = _open_client(path)
@@ -222,7 +228,7 @@ def search(
             limit=top_k,
             query_filter=query_filter,
         ).points
-        return [
+        results = [
             SearchResult(
                 chunk_id=hit.payload["chunk_id"],
                 page_no=hit.payload["page_no"],
@@ -234,6 +240,10 @@ def search(
         ]
     finally:
         client.close()
+
+    if min_score is None:
+        return results
+    return [result for result in results if result.score >= min_score]
 
 
 # --------------------------------------------------------------------------- #

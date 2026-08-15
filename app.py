@@ -45,6 +45,13 @@ def main():
             step=1,
             placeholder="любая",
         )
+        min_score = st.slider(
+            "Минимальный score",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0,
+            step=0.05,
+        )
 
     query = st.text_input("Введите запрос к документации:")
 
@@ -52,9 +59,15 @@ def main():
         page_range = None
         if page_from is not None and page_to is not None:
             page_range = (int(page_from), int(page_to))
+        score_floor = min_score if min_score > 0.0 else None
         with st.spinner("Ищем в базе знаний..."):
             try:
-                results = search(query, DEFAULT_COLLECTION, pages=page_range)
+                results = search(
+                    query,
+                    DEFAULT_COLLECTION,
+                    pages=page_range,
+                    min_score=score_floor,
+                )
             except ValueError as exc:
                 st.error(str(exc))
                 results = []

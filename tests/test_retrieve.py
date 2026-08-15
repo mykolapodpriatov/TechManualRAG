@@ -206,6 +206,76 @@ def test_search_pages_restricts_hits_to_range(qdrant_path: str) -> None:
     assert len(unfiltered) == 3
 
 
+def test_search_min_score_drops_weak_hits(qdrant_path: str) -> None:
+    # Unit vectors so cosine equals the first component against query [1, 0]:
+    # strong -> 0.9, weak -> 0.1.
+    query_text = "query"
+    strong_text = "strong"
+    weak_text = "weak"
+    table = {
+        query_text: [1.0, 0.0],
+        strong_text: [0.9, 0.19**0.5],
+        weak_text: [0.1, 0.99**0.5],
+    }
+
+    def known_embedder(texts: list[str]) -> list[list[float]]:
+        return [table[text] for text in texts]
+
+    build_index(
+        [
+            PageChunks(page_no=1, chunks=[strong_text]),
+            PageChunks(page_no=2, chunks=[weak_text]),
+        ],
+        "manuals",
+        path=qdrant_path,
+        embedder=known_embedder,
+    )
+
+    kept = search(
+        query_text,
+        "manuals",
+        path=qdrant_path,
+        top_k=5,
+        min_score=0.5,
+        embedder=known_embedder,
+    )
+    assert len(kept) == 1
+    assert kept[0].text == strong_text
+    assert kept[0].score == pytest.approx(0.9, abs=1e-5)
+
+    both = search(
+        query_text,
+        "manuals",
+        path=qdrant_path,
+        top_k=5,
+        min_score=None,
+        embedder=known_embedder,
+    )
+    assert {result.text for result in both} == {strong_text, weak_text}
+    by_text = {result.text: result.score for result in both}
+    assert by_text[strong_text] == pytest.approx(0.9, abs=1e-5)
+    assert by_text[weak_text] == pytest.approx(0.1, abs=1e-5)
+
+
+def test_search_min_score_rejects_out_of_range(qdrant_path: str) -> None:
+    with pytest.raises(ValueError, match="min_score"):
+        search(
+            "torque",
+            "manuals",
+            path=qdrant_path,
+            min_score=-0.1,
+            embedder=_stub_embedder,
+        )
+    with pytest.raises(ValueError, match="min_score"):
+        search(
+            "torque",
+            "manuals",
+            path=qdrant_path,
+            min_score=1.1,
+            embedder=_stub_embedder,
+        )
+
+
 def test_search_pages_rejects_inverted_range(qdrant_path: str) -> None:
     build_index([TORQUE_CHUNKS], "manuals", path=qdrant_path, embedder=_stub_embedder)
     with pytest.raises(ValueError, match="pages"):

@@ -1,7 +1,7 @@
 import streamlit as st
 
 from ingest import extract_pages
-from retrieve import DEFAULT_COLLECTION, search
+from retrieve import DEFAULT_COLLECTION, index_pages, search
 
 PREVIEW_CHARS = 2000
 
@@ -20,6 +20,37 @@ def main():
             st.error(f"Не удалось обработать PDF: {exc}")
         else:
             st.success(f"Файл загружен. Извлечено страниц: {len(pages)}.")
+
+            # Indexing is behind an explicit button, not automatic on upload:
+            # embedding a large manual takes real time, and Streamlit reruns
+            # this script on every widget interaction.
+            st.caption(
+                "При первом запуске индексации скачивается локальная модель "
+                "эмбеддингов (~130 МБ). Это происходит один раз."
+            )
+            if st.button("Проиндексировать", type="primary"):
+                with st.spinner("Индексируем руководство..."):
+                    try:
+                        indexed = index_pages(pages, DEFAULT_COLLECTION)
+                    except ValueError as exc:
+                        st.error(f"Не удалось проиндексировать: {exc}")
+                    except OSError as exc:
+                        # The embedded Qdrant store is a local directory held
+                        # open by whichever client has it; a second process
+                        # (or a stale lock) surfaces here.
+                        st.error(f"Не удалось открыть хранилище Qdrant: {exc}")
+                    else:
+                        if indexed == 0:
+                            st.warning(
+                                "В документе нет извлекаемого текста, "
+                                "индексировать нечего."
+                            )
+                        else:
+                            st.success(
+                                f"Проиндексировано чанков: {indexed} "
+                                f"(страниц: {len(pages)})."
+                            )
+
             for page in pages:
                 with st.expander(f"Страница {page.page_no}"):
                     if page.text:
@@ -27,7 +58,6 @@ def main():
                     else:
                         st.caption("(на этой странице нет извлекаемого текста)")
         # TODO: Кропы изображений и таблиц
-        # TODO: Индексация в Qdrant
 
     with st.sidebar:
         st.subheader("Страницы")
@@ -74,8 +104,7 @@ def main():
 
         if not results:
             st.info(
-                "Ничего не найдено. Сначала проиндексируйте руководство: "
-                "`python ingest.py manual.pdf --index`."
+                "Ничего не найдено. Загрузите PDF выше и нажмите «Проиндексировать»."
             )
         else:
             for result in results:

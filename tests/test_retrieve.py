@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from ingest import PageChunks
-from retrieve import SearchResult, build_index, embed_chunks, search
+from ingest import Page, PageChunks, chunk_id, chunk_pages
+from retrieve import SearchResult, build_index, embed_chunks, index_pages, search
 
 _STUB_DIMS = 32
 
@@ -294,3 +294,135 @@ def test_build_index_persists_across_client_instances(qdrant_path: str) -> None:
     build_index([TORQUE_CHUNKS], "manuals", path=qdrant_path, embedder=_stub_embedder)
     results = search("torque", "manuals", path=qdrant_path, embedder=_stub_embedder)
     assert len(results) == 1
+
+
+# --------------------------------------------------------------------------- #
+# index_pages
+# --------------------------------------------------------------------------- #
+
+
+def _page(page_no: int, text: str) -> Page:
+    return Page(page_no=page_no, text=text)
+
+
+def test_index_pages_makes_pages_searchable(qdrant_path: str) -> None:
+    """The whole path the UI uses: extracted pages in, searchable chunks out."""
+    pages = [
+        _page(1, "Torque spec for the head bolts: tighten to 35 Nm in a star pattern."),
+        _page(2, "Warranty terms and customer support contact information."),
+    ]
+
+    indexed = index_pages(
+        pages,
+        "manuals",
+        qdrant_path,
+        chunk_size=200,
+        overlap=0,
+        embedder=_stub_embedder,
+    )
+    assert indexed == 2
+
+    hits = search(
+        "torque spec head bolts", "manuals", path=qdrant_path, embedder=_stub_embedder
+    )
+    assert hits
+    assert hits[0].page_no == 1
+
+
+def test_index_pages_returns_the_chunk_count(qdrant_path: str) -> None:
+    """The count is what the UI reports, so it must match what was stored."""
+    long_page = _page(1, "abcdefghij " * 20)
+
+    indexed = index_pages(
+        [long_page],
+        "manuals",
+        qdrant_path,
+        chunk_size=50,
+        overlap=10,
+        embedder=_stub_embedder,
+    )
+
+    expected = sum(len(pc.chunks) for pc in chunk_pages([long_page], 50, 10))
+    assert indexed == expected > 1
+
+
+def test_index_pages_agrees_with_the_cli_chunk_ids(qdrant_path: str) -> None:
+    """UI and CLI must key the same document on the same ids, or a re-index
+    through the other path would duplicate every point instead of updating it."""
+    pages = [_page(1, "Hydraulic pump X100 overview and safety notices." * 5)]
+
+    index_pages(
+        pages,
+        "manuals",
+        qdrant_path,
+        chunk_size=60,
+        overlap=10,
+        embedder=_stub_embedder,
+    )
+    hits = search(
+        "hydraulic pump", "manuals", top_k=50, path=qdrant_path, embedder=_stub_embedder
+    )
+
+    expected_ids = {
+        chunk_id(pc.page_no, index)
+        for pc in chunk_pages(pages, 60, 10)
+        for index in range(len(pc.chunks))
+    }
+    assert {hit.chunk_id for hit in hits} == expected_ids
+
+
+def test_index_pages_is_idempotent(qdrant_path: str) -> None:
+    """Indexing the same document twice updates points instead of duplicating."""
+    pages = [_page(1, "Torque spec for the head bolts: tighten to 35 Nm.")]
+
+    first = index_pages(
+        pages,
+        "manuals",
+        qdrant_path,
+        chunk_size=200,
+        overlap=0,
+        embedder=_stub_embedder,
+    )
+    second = index_pages(
+        pages,
+        "manuals",
+        qdrant_path,
+        chunk_size=200,
+        overlap=0,
+        embedder=_stub_embedder,
+    )
+    assert first == second == 1
+
+    hits = search(
+        "torque", "manuals", top_k=50, path=qdrant_path, embedder=_stub_embedder
+    )
+    assert len(hits) == 1
+
+
+def test_index_pages_on_a_textless_document_writes_nothing(qdrant_path: str) -> None:
+    """A scanned PDF has no extractable text; that is a warning, not a crash,
+    and it must not leave an empty collection behind."""
+    indexed = index_pages(
+        [_page(1, ""), _page(2, "")],
+        "manuals",
+        qdrant_path,
+        embedder=_stub_embedder,
+    )
+
+    assert indexed == 0
+    assert (
+        search("anything", "manuals", path=qdrant_path, embedder=_stub_embedder) == []
+    )
+
+
+def test_index_pages_rejects_bad_chunking(qdrant_path: str) -> None:
+    """Invalid chunk settings surface as ValueError for the UI to display."""
+    with pytest.raises(ValueError):
+        index_pages(
+            [_page(1, "some text")],
+            "manuals",
+            qdrant_path,
+            chunk_size=10,
+            overlap=10,
+            embedder=_stub_embedder,
+        )

@@ -27,7 +27,14 @@ from dataclasses import dataclass
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
-from ingest import PageChunks, chunk_id
+from ingest import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_OVERLAP,
+    Page,
+    PageChunks,
+    chunk_id,
+    chunk_pages,
+)
 
 DEFAULT_COLLECTION = "manuals"
 DEFAULT_QDRANT_PATH = "data/qdrant"
@@ -157,6 +164,49 @@ def build_index(
         client.upsert(collection_name=collection_name, points=points)
     finally:
         client.close()
+
+
+def index_pages(
+    pages: list[Page],
+    collection_name: str,
+    path: str = DEFAULT_QDRANT_PATH,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_OVERLAP,
+    words: bool = False,
+    embedder: Embedder | None = None,
+) -> int:
+    """Chunk ``pages`` and index them, returning how many chunks were stored.
+
+    This is the one path from extracted pages to a searchable collection, so
+    the Streamlit UI and the ``ingest.py --index`` CLI produce identical chunk
+    ids for the same document and chunking settings. Re-indexing a document
+    updates its points in place, because :func:`build_index` keys them on
+    :func:`ingest.chunk_id`.
+
+    Args:
+        pages: Extracted pages, as produced by :func:`ingest.extract_pages`.
+        collection_name: Qdrant collection to create (if missing) and upsert into.
+        path: Directory for the local Qdrant store.
+        chunk_size: Chunk window, in characters (or words when ``words``).
+        overlap: Overlap between neighboring chunks.
+        words: Chunk on whole-word boundaries instead of characters.
+        embedder: Optional embedding backend override; see :func:`embed_chunks`.
+
+    Returns:
+        The number of chunks embedded and upserted. Zero when ``pages`` holds
+        no extractable text, in which case nothing is written.
+
+    Raises:
+        ValueError: If ``chunk_size`` / ``overlap`` are invalid, as raised by
+            :func:`ingest.chunk_pages`.
+    """
+    page_chunks = chunk_pages(pages, chunk_size, overlap, words=words)
+    total = sum(len(pc.chunks) for pc in page_chunks)
+    if total == 0:
+        return 0
+    build_index(page_chunks, collection_name, path=path, embedder=embedder)
+    return total
 
 
 def _page_range_filter(pages: tuple[int, int] | None) -> qmodels.Filter | None:

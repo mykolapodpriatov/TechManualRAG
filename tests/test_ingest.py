@@ -14,10 +14,13 @@ from ingest import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_OVERLAP,
     Page,
+    chunk_id,
     chunk_pages,
     chunk_text,
     chunk_text_words,
+    extract_images,
     extract_pages,
+    image_id,
 )
 
 PAGE_ONE_TEXT = "Hydraulic Pump Model X100\nMaintenance Schedule"
@@ -275,3 +278,149 @@ def test_chunk_pages_words_mode_routes_through_word_chunker(
         for token in chunk.split()
     )
     assert char_fragments
+
+
+# --------------------------------------------------------------------------- #
+# extract_images
+# --------------------------------------------------------------------------- #
+
+
+def _png_bytes(
+    width: int, height: int, colour: tuple[int, int, int] = (200, 30, 30)
+) -> bytes:
+    """A solid-colour PNG, built with PyMuPDF so no binary is checked in."""
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height))
+    pix.set_rect(pix.irect, colour)
+    return pix.tobytes("png")
+
+
+def _pdf_with_images(
+    placements: list[list[tuple[float, float, float, float]]],
+    *,
+    image_size: int = 64,
+) -> bytes:
+    """Render a PDF where page ``i`` carries ``placements[i]`` image rectangles."""
+    png = _png_bytes(image_size, image_size)
+    doc = fitz.open()
+    try:
+        for rects in placements:
+            page = doc.new_page()
+            page.insert_text((72, 720), "caption", fontsize=11)
+            for rect in rects:
+                page.insert_image(fitz.Rect(*rect), stream=png)
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
+def test_finds_a_placement_with_its_page_and_box() -> None:
+    pdf = _pdf_with_images([[(100.0, 200.0, 300.0, 400.0)]])
+
+    images = extract_images(pdf)
+
+    assert len(images) == 1
+    img = images[0]
+    assert img.page_no == 1
+    assert img.index == 0
+    assert img.bbox == pytest.approx((100.0, 200.0, 300.0, 400.0), abs=0.5)
+    assert img.width == pytest.approx(200.0, abs=0.5)
+    assert img.height == pytest.approx(200.0, abs=0.5)
+    assert img.fmt == "png"
+    assert len(img.data) > 0
+
+
+def test_the_same_image_placed_twice_yields_two_placements() -> None:
+    """A placement, not an image: each spot is a location a reader might mean."""
+    pdf = _pdf_with_images([[(50.0, 50.0, 150.0, 150.0), (50.0, 300.0, 150.0, 400.0)]])
+
+    images = extract_images(pdf)
+
+    assert len(images) == 2
+    assert [img.index for img in images] == [0, 1]
+    assert images[0].bbox[1] < images[1].bbox[1]
+
+
+def test_placements_are_ordered_top_to_bottom_then_left_to_right() -> None:
+    """Index has to be a property of the page, not of the PDF's object order."""
+    pdf = _pdf_with_images(
+        [
+            [
+                (300.0, 400.0, 400.0, 500.0),  # bottom right
+                (100.0, 100.0, 200.0, 200.0),  # top left
+                (300.0, 100.0, 400.0, 200.0),  # top right
+            ]
+        ]
+    )
+
+    images = extract_images(pdf)
+
+    assert [(round(i.bbox[1]), round(i.bbox[0])) for i in images] == [
+        (100, 100),
+        (100, 300),
+        (400, 300),
+    ]
+
+
+def test_ids_are_stable_across_runs() -> None:
+    pdf = _pdf_with_images(
+        [[(100.0, 100.0, 200.0, 200.0)], [(50.0, 50.0, 200.0, 200.0)]]
+    )
+
+    first = [image_id(i.page_no, i.index) for i in extract_images(pdf)]
+    second = [image_id(i.page_no, i.index) for i in extract_images(pdf)]
+
+    assert first == second == ["p1-i0", "p2-i0"]
+
+
+def test_image_id_matches_the_chunk_id_shape() -> None:
+    """One convention for both, and never confusable for each other."""
+    assert image_id(3, 1) == "p3-i1"
+    assert chunk_id(3, 1) == "p3-c1"
+
+
+def test_a_page_with_no_images_contributes_nothing() -> None:
+    pdf = _pdf_with_images([[], [(100.0, 100.0, 200.0, 200.0)]])
+
+    images = extract_images(pdf)
+
+    assert [img.page_no for img in images] == [2]
+
+
+def test_specks_below_the_size_floor_are_not_figures() -> None:
+    """A page border and a table rule are raster images too."""
+    pdf = _pdf_with_images(
+        [
+            [
+                (100.0, 100.0, 105.0, 400.0),  # a 5pt-wide rule
+                (100.0, 500.0, 300.0, 700.0),  # a real figure
+            ]
+        ]
+    )
+
+    images = extract_images(pdf)
+
+    assert len(images) == 1
+    assert images[0].width == pytest.approx(200.0, abs=0.5)
+
+
+def test_the_size_floor_is_configurable() -> None:
+    pdf = _pdf_with_images([[(100.0, 100.0, 130.0, 130.0)]])
+
+    assert extract_images(pdf, min_size=40.0) == []
+    assert len(extract_images(pdf, min_size=10.0)) == 1
+
+
+def test_empty_input_and_a_negative_floor_are_rejected() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        extract_images(b"")
+    with pytest.raises(ValueError, match="min_size"):
+        extract_images(_pdf_with_images([[]]), min_size=-1.0)
+
+
+def test_a_non_pdf_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Could not open PDF"):
+        extract_images(b"not a pdf at all")
+
+
+def test_a_text_only_pdf_has_no_images() -> None:
+    assert extract_images(_make_pdf([PAGE_ONE_TEXT, PAGE_TWO_TEXT])) == []

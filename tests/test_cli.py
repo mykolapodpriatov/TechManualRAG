@@ -263,3 +263,122 @@ def test_index_flag_does_not_pollute_json_stdout(
         out
     )  # would raise if the index confirmation leaked into stdout
     assert [record["page"] for record in payload] == [1, 2, 3]
+
+
+# --------------------------------------------------------------------------- #
+# --images
+# --------------------------------------------------------------------------- #
+
+
+def _write_pdf_with_image(path: Path) -> None:
+    """Two pages: one carrying a figure, one text only."""
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 64, 64))
+    pix.set_rect(pix.irect, (20, 90, 160))
+    png = pix.tobytes("png")
+
+    doc = fitz.open()
+    try:
+        first = doc.new_page()
+        first.insert_text((72, 720), "Figure 1: pump schematic", fontsize=11)
+        first.insert_image(fitz.Rect(100, 150, 300, 350), stream=png)
+        second = doc.new_page()
+        second.insert_text(
+            (72, 72), "Torque table and tightening procedure.", fontsize=11
+        )
+        doc.save(str(path))
+    finally:
+        doc.close()
+
+
+@pytest.fixture
+def pdf_with_image(tmp_path: Path) -> Path:
+    path = tmp_path / "manual-with-figure.pdf"
+    _write_pdf_with_image(path)
+    return path
+
+
+def test_images_json_reports_page_id_box_and_size(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([str(pdf_with_image), "--json", "--images"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"pages", "images"}
+    assert len(payload["images"]) == 1
+    image = payload["images"][0]
+    assert image["id"] == "p1-i0"
+    assert image["page"] == 1
+    assert image["format"] == "png"
+    assert image["bytes"] > 0
+    assert image["bbox"] == pytest.approx([100.0, 150.0, 300.0, 350.0], abs=0.5)
+    assert image["width"] == pytest.approx(200.0, abs=0.5)
+
+
+def test_images_json_never_emits_the_bytes_themselves(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """This CLI is meant to stay pipeable; a base64 blob would end that."""
+    main([str(pdf_with_image), "--json", "--images"])
+
+    image = json.loads(capsys.readouterr().out)["images"][0]
+    assert "data" not in image
+    assert isinstance(image["bytes"], int)
+
+
+def test_json_without_images_keeps_the_old_shape(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Existing consumers parse a bare array of page records."""
+    main([str(pdf_with_image), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list)
+    assert set(payload[0]) == {"page", "chunks"}
+
+
+def test_human_readable_images_section(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([str(pdf_with_image), "--images"]) == 0
+
+    out = capsys.readouterr().out
+    assert "--- 1 image(s) ---" in out
+    assert "[p1-i0]" in out
+    assert "png" in out
+
+
+def test_pages_filter_applies_to_images_too(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Otherwise the two halves of one report describe different documents."""
+    assert main([str(pdf_with_image), "--json", "--images", "--pages", "2"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["images"] == []
+    assert [p["page"] for p in payload["pages"]] == [2]
+
+
+def test_min_image_size_filters_out_a_figure(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        main([str(pdf_with_image), "--json", "--images", "--min-image-size", "500"])
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["images"] == []
+
+
+def test_a_negative_min_image_size_exits_nonzero(
+    pdf_with_image: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([str(pdf_with_image), "--images", "--min-image-size", "-1"]) != 0
+    assert "min_size" in capsys.readouterr().err
+
+
+def test_a_text_only_pdf_reports_no_images(
+    pdf_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([str(pdf_path), "--json", "--images"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["images"] == []

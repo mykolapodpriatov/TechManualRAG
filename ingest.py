@@ -29,6 +29,12 @@ import fitz  # PyMuPDF
 DEFAULT_CHUNK_SIZE = 512
 DEFAULT_OVERLAP = 50
 
+# Smallest placement, in PDF points, that counts as a figure. A page border, a
+# table rule and a one-pixel spacer are all raster images as far as the PDF is
+# concerned, and calling them figures would bury the real ones. 24pt is a third
+# of an inch: smaller than any diagram worth indexing, larger than any rule.
+DEFAULT_MIN_IMAGE_SIZE = 24.0
+
 # Mirrors retrieve.DEFAULT_COLLECTION / retrieve.DEFAULT_QDRANT_PATH, duplicated
 # here (rather than imported) so building the CLI parser never requires
 # qdrant-client to be installed unless --index is actually used.
@@ -45,6 +51,35 @@ class Page:
 
     page_no: int
     text: str
+
+
+@dataclass(frozen=True)
+class PageImage:
+    """One placement of one image on one page.
+
+    A placement, not an image: the same embedded picture can appear on a page
+    more than once, and each spot is a separate location a reader might mean.
+
+    ``bbox`` is ``(x0, y0, x1, y1)`` in PDF points, the coordinate system
+    PyMuPDF reports and the one a viewer's page coordinates match, so a caller
+    can crop or highlight without a second conversion.
+    """
+
+    page_no: int
+    index: int
+    bbox: tuple[float, float, float, float]
+    fmt: str
+    data: bytes
+
+    @property
+    def width(self) -> float:
+        """Placement width in PDF points."""
+        return self.bbox[2] - self.bbox[0]
+
+    @property
+    def height(self) -> float:
+        """Placement height in PDF points."""
+        return self.bbox[3] - self.bbox[1]
 
 
 @dataclass(frozen=True)
@@ -83,6 +118,111 @@ def extract_pages(pdf_bytes: bytes) -> list[Page]:
         ]
     finally:
         doc.close()
+
+
+def image_id(page_no: int, index: int) -> str:
+    """Stable identifier for one image placement within a document.
+
+    Same shape as :func:`chunk_id` (``"p1-i0"`` beside ``"p1-c0"``) so a later
+    indexing step has one convention to key on for both, and so the two can
+    never be confused for each other.
+    """
+    return f"p{page_no}-i{index}"
+
+
+def extract_images(
+    pdf_bytes: bytes,
+    min_size: float = DEFAULT_MIN_IMAGE_SIZE,
+) -> list[PageImage]:
+    """Extract raster image placements from an in-memory PDF.
+
+    Diagrams, schematics and photographed tables are where most of the value in
+    a technical manual lives, and text extraction drops all of it. This finds
+    where those images sit; embedding them is a separate step.
+
+    Placements are read from the page rather than from the document's image
+    table, so an image reused three times on a page yields three results with
+    three bounding boxes. Placements are ordered by position, top to bottom then
+    left to right, so ``index`` is stable across runs rather than following
+    whatever order the PDF happens to store its objects in.
+
+    Two image objects occupying the exact same rectangle are reported once. PDF
+    writers routinely emit one picture as several objects, and each object then
+    reports every rectangle the picture occupies, so without this the same
+    figure comes back squared. Telling a genuine overlay apart from that
+    duplication would need pixel comparison, which is out of proportion to how
+    often two different images are stacked precisely.
+
+    Args:
+        pdf_bytes: Raw bytes of a PDF document.
+        min_size: Minimum placement width AND height, in PDF points. Anything
+            smaller is a rule, a border or a spacer rather than a figure.
+
+    Returns:
+        One :class:`PageImage` per surviving placement, across all pages.
+
+    Raises:
+        ValueError: If ``pdf_bytes`` is empty, is not a readable PDF, or
+            ``min_size`` is negative.
+    """
+    if not pdf_bytes:
+        raise ValueError("PDF input is empty (0 bytes).")
+    if min_size < 0:
+        raise ValueError(f"min_size must be >= 0, got {min_size!r}")
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:  # PyMuPDF raises several low-level error types.
+        raise ValueError(f"Could not open PDF: {exc}") from exc
+
+    out: list[PageImage] = []
+    try:
+        for page_index, page in enumerate(doc):
+            placements = []
+            seen: set[tuple[float, float, float, float]] = set()
+            for info in page.get_images(full=True):
+                xref = info[0]
+                for rect in page.get_image_rects(xref):
+                    if rect.width < min_size or rect.height < min_size:
+                        continue
+                    key = (
+                        round(rect.x0, 3),
+                        round(rect.y0, 3),
+                        round(rect.x1, 3),
+                        round(rect.y1, 3),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    placements.append((key[1], key[0], rect, xref))
+
+            # Reading order, so index is a property of the page rather than of
+            # the file's internal object ordering.
+            placements.sort(key=lambda item: (item[0], item[1]))
+
+            for index, (_, _, rect, xref) in enumerate(placements):
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:  # A broken or unsupported stream.
+                    continue
+                out.append(
+                    PageImage(
+                        page_no=page_index + 1,
+                        index=index,
+                        bbox=(
+                            float(rect.x0),
+                            float(rect.y0),
+                            float(rect.x1),
+                            float(rect.y1),
+                        ),
+                        fmt=str(extracted.get("ext", "")),
+                        data=bytes(extracted.get("image", b"")),
+                    )
+                )
+    finally:
+        doc.close()
+
+    return out
 
 
 def chunk_text(
@@ -281,6 +421,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit a JSON array of {page, chunks} records to stdout.",
     )
     parser.add_argument(
+        "--images",
+        action="store_true",
+        help=(
+            "Also report raster image placements (diagrams, schematics, scanned "
+            "tables) with their page, id, bounding box in PDF points and format."
+        ),
+    )
+    parser.add_argument(
+        "--min-image-size",
+        type=float,
+        default=DEFAULT_MIN_IMAGE_SIZE,
+        metavar="PT",
+        help=(
+            "Smallest image placement counted as a figure, in PDF points "
+            f"(default: {DEFAULT_MIN_IMAGE_SIZE:g}). Below this are page "
+            "borders, table rules and spacers."
+        ),
+    )
+    parser.add_argument(
         "--with-ids",
         action="store_true",
         dest="with_ids",
@@ -343,6 +502,27 @@ def _fail(message: str) -> int:
     return _EXIT_USAGE
 
 
+def _image_records(images: list[PageImage]) -> list[dict[str, object]]:
+    """Build the ``--json --images`` payload.
+
+    Byte counts, never the bytes: this CLI is meant to stay pipeable, and
+    base64 blobs in a JSON stream would make that useless. A caller that wants
+    the pixels calls :func:`extract_images` directly.
+    """
+    return [
+        {
+            "id": image_id(img.page_no, img.index),
+            "page": img.page_no,
+            "bbox": list(img.bbox),
+            "width": round(img.width, 3),
+            "height": round(img.height, 3),
+            "format": img.fmt,
+            "bytes": len(img.data),
+        }
+        for img in images
+    ]
+
+
 def _json_records(
     page_chunks: list[PageChunks], *, with_ids: bool
 ) -> list[dict[str, object]]:
@@ -401,6 +581,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         return _fail(str(exc))
 
+    images: list[PageImage] = []
+    if args.images:
+        try:
+            images = extract_images(pdf_bytes, min_size=args.min_image_size)
+        except ValueError as exc:
+            return _fail(str(exc))
+        if args.pages is not None:
+            # --pages already narrowed the text; the figures follow it, or the
+            # two halves of one report would describe different documents.
+            images = [img for img in images if lo <= img.page_no <= hi]
+
     if args.index:
         # Imported lazily: qdrant-client (and the embedding model it triggers)
         # is only needed when --index is actually requested, keeping plain
@@ -418,7 +609,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.as_json:
-        payload = _json_records(page_chunks, with_ids=args.with_ids)
+        payload: object = _json_records(page_chunks, with_ids=args.with_ids)
+        if args.images:
+            # A second top-level key rather than images nested per page: a
+            # consumer that only wants figures should not have to walk the text.
+            payload = {"pages": payload, "images": _image_records(images)}
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:
@@ -427,6 +622,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             for index, chunk in enumerate(pc.chunks, start=1):
                 preview = " ".join(chunk[:80].split())
                 print(f"  [{index}] {preview}")
+        if args.images:
+            print(f"--- {len(images)} image(s) ---")
+            for img in images:
+                x0, y0, x1, y1 = img.bbox
+                print(
+                    f"  [{image_id(img.page_no, img.index)}] page {img.page_no} "
+                    f"{img.fmt or '?'} {img.width:.0f}x{img.height:.0f}pt "
+                    f"at ({x0:.0f}, {y0:.0f})-({x1:.0f}, {y1:.0f}) "
+                    f"{len(img.data)} bytes"
+                )
 
     return 0
 

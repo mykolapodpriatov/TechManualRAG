@@ -197,8 +197,17 @@ def extract_images(
                     placements.append((key[1], key[0], rect, xref))
 
             # Reading order, so index is a property of the page rather than of
-            # the file's internal object ordering.
-            placements.sort(key=lambda item: (item[0], item[1]))
+            # the file's internal object ordering. A shared top-left still needs
+            # the opposite corner, or two placements swap when the PDF lists
+            # them the other way around.
+            placements.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                    round(item[2].y1, 3),
+                    round(item[2].x1, 3),
+                )
+            )
 
             for index, (_, _, rect, xref) in enumerate(placements):
                 try:

@@ -361,6 +361,23 @@ def test_placements_are_ordered_top_to_bottom_then_left_to_right() -> None:
     ]
 
 
+def test_same_top_left_keeps_one_order_regardless_of_insertion() -> None:
+    """Two figures that share a top-left must not swap when the PDF lists them backwards."""
+    wide = (100.0, 100.0, 220.0, 160.0)
+    tall = (100.0, 100.0, 180.0, 180.0)
+
+    def boxes(
+        rects: list[tuple[float, float, float, float]],
+    ) -> list[tuple[float, float, float, float]]:
+        return [image.bbox for image in extract_images(_pdf_with_images([rects]))]
+
+    for rects in ([wide, tall], [tall, wide]):
+        found = boxes(rects)
+        assert len(found) == 2
+        assert found[0] == pytest.approx(wide, abs=0.5)
+        assert found[1] == pytest.approx(tall, abs=0.5)
+
+
 def test_ids_are_stable_across_runs() -> None:
     pdf = _pdf_with_images(
         [[(100.0, 100.0, 200.0, 200.0)], [(50.0, 50.0, 200.0, 200.0)]]
